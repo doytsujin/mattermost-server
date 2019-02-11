@@ -56,7 +56,7 @@ func NewDatabaseStore(dsn string) (ds *DatabaseStore, err error) {
 		dataSourceName: dataSourceName,
 		db:             db,
 	}
-	if err = ds.initialize(); err != nil {
+	if err = initializeConfigurationsTable(ds.db); err != nil {
 		return nil, errors.Wrap(err, "failed to initialize")
 	}
 
@@ -204,9 +204,9 @@ func (ds *DatabaseStore) persist(cfg *model.Config) error {
 	return nil
 }
 
-// initialize ensures the requisite tables in place to form the backing store.
-func (ds *DatabaseStore) initialize() error {
-	_, err := ds.db.Exec(`
+// initializeConfigurationsTable ensures the requisite tables in place to form the backing store.
+func initializeConfigurationsTable(db *sqlx.DB) error {
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS Configurations (
 		    Id VARCHAR(26) PRIMARY KEY,
 		    Value TEXT NOT NULL,
@@ -234,6 +234,8 @@ func (ds *DatabaseStore) Load() (err error) {
 
 	// Initialize from the default config if no active configuration could be found.
 	if len(configurationData) == 0 {
+		needsSave = true
+
 		defaultCfg := model.Config{}
 		defaultCfg.SetDefaults()
 
