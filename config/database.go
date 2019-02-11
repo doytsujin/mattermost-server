@@ -5,48 +5,61 @@ package config
 
 import (
 	"bytes"
+	"database/sql"
 	"io"
 	"io/ioutil"
 	"net/url"
+	"strings"
 	"sync"
 
-	sql "github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
 
 	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
+
+	// Load the MySQL driver
+	_ "github.com/go-sql-driver/mysql"
+	// Load the Postgres driver
+	_ "github.com/lib/pq"
 )
 
-// databaseStore is a config store backed by a database.
-type databaseStore struct {
+// DatabaseStore is a config store backed by a database.
+type DatabaseStore struct {
 	emitter
 
 	config               *model.Config
 	environmentOverrides map[string]interface{}
 	configLock           sync.RWMutex
-	dsn                  string
-	db                   *sql.DB
+	originalDsn          string
+	driverName           string
+	dataSourceName       string
+	db                   *sqlx.DB
 }
 
 // NewDatabaseStore creates a new instance of a config store backed by the given database.
-func NewDatabaseStore(dsn string) (ds *databaseStore, err error) {
-	// TODO: Connection logic should probably be refactored and shared by both store and config,
-	// with the config store accepting a *sql.DB directly.
+func NewDatabaseStore(dsn string) (ds *DatabaseStore, err error) {
 	driverName, dataSourceName, err := parseDSN(dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid DSN")
 	}
 
-	// TODO: Retry logic, once refactored as above.
-	db, err := sql.Open(driverName, dataSourceName)
+	// TODO: Retry logic?
+	db, err := sqlx.Open(driverName, dataSourceName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to connect to %s database", driverName)
 	}
 
-	ds = &databaseStore{
-		dsn: dsn,
-		db:  db,
+	ds = &DatabaseStore{
+		driverName:     driverName,
+		originalDsn:    dsn,
+		dataSourceName: dataSourceName,
+		db:             db,
 	}
+	if err = ds.initialize(); err != nil {
+		return nil, errors.Wrap(err, "failed to initialize")
+	}
+
 	if err = ds.Load(); err != nil {
 		return nil, errors.Wrap(err, "failed to load")
 	}
@@ -61,6 +74,8 @@ func NewDatabaseStore(dsn string) (ds *databaseStore, err error) {
 // returns
 //	driverName = mysql
 //	dataSourceName = mmuser:mostest@dockerhost:5432/mattermost_test
+//
+// By contrast, a Postgres DSN is returned unmodified.
 func parseDSN(dsn string) (string, string, error) {
 	// Treat the DSN as the URL that it is.
 	u, err := url.Parse(dsn)
@@ -69,18 +84,24 @@ func parseDSN(dsn string) (string, string, error) {
 	}
 
 	scheme := u.Scheme
-	if scheme != "mysql" && scheme != "postgres" {
+	switch scheme {
+	case "mysql":
+		// Strip off the mysql:// for the dsn with which to connect.
+		u.Scheme = ""
+		dsn = strings.TrimPrefix(u.String(), "//")
+
+	case "postgres":
+		// No changes required
+
+	default:
 		return "", "", errors.Wrapf(err, "unsupported scheme %s", scheme)
 	}
 
-	// u.Scheme = ""
-	mlog.Info("dsn", mlog.String("dsn", dsn), mlog.String("dataSourceName", dsn))
 	return scheme, dsn, nil
-	// strings.TrimPrefix("//", u.String()), nil
 }
 
 // Get fetches the current, cached configuration.
-func (ds *databaseStore) Get() *model.Config {
+func (ds *DatabaseStore) Get() *model.Config {
 	ds.configLock.RLock()
 	defer ds.configLock.RUnlock()
 
@@ -88,7 +109,7 @@ func (ds *databaseStore) Get() *model.Config {
 }
 
 // GetEnvironmentOverrides fetches the configuration fields overridden by environment variables.
-func (ds *databaseStore) GetEnvironmentOverrides() map[string]interface{} {
+func (ds *DatabaseStore) GetEnvironmentOverrides() map[string]interface{} {
 	ds.configLock.RLock()
 	defer ds.configLock.RUnlock()
 
@@ -96,7 +117,7 @@ func (ds *databaseStore) GetEnvironmentOverrides() map[string]interface{} {
 }
 
 // Set replaces the current configuration in its entirety, without updating the backing store.
-func (ds *databaseStore) Set(newCfg *model.Config) (*model.Config, error) {
+func (ds *DatabaseStore) Set(newCfg *model.Config) (*model.Config, error) {
 	ds.configLock.Lock()
 	var unlockOnce sync.Once
 	defer unlockOnce.Do(ds.configLock.Unlock)
@@ -140,7 +161,7 @@ func (ds *databaseStore) Set(newCfg *model.Config) (*model.Config, error) {
 }
 
 // persist writes the configuration to the configured database.
-func (ds *databaseStore) persist(cfg *model.Config) error {
+func (ds *DatabaseStore) persist(cfg *model.Config) error {
 	b, err := marshalConfig(cfg)
 	if err != nil {
 		return errors.Wrap(err, "failed to serialize")
@@ -150,7 +171,7 @@ func (ds *databaseStore) persist(cfg *model.Config) error {
 	value := string(b)
 	createAt := model.GetMillis()
 
-	tx, err := ds.db.Begin()
+	tx, err := ds.db.Beginx()
 	if err != nil {
 		return errors.Wrap(err, "failed to begin transaction")
 	}
@@ -168,20 +189,14 @@ func (ds *databaseStore) persist(cfg *model.Config) error {
 		"key":       "ConfigurationId",
 	}
 
-	// TODO: Table creation?
-	if _, err := tx.NamedExec("INSERT INTO Configurations (Id, Value, CreateAt) VALUES (:id, :value, :create_at)", params); err != nil {
+	if _, err := tx.Exec("UPDATE Configurations SET Active = NULL WHERE Active"); err != nil {
+		return errors.Wrap(err, "failed to deactivate current configuration")
+	}
+
+	if _, err := tx.NamedExec("INSERT INTO Configurations (Id, Value, CreateAt, Active) VALUES (:id, :value, :create_at, TRUE)", params); err != nil {
 		return errors.Wrap(err, "failed to record new configuration")
 	}
-	// TODO: Upsert
-	if result, err := tx.NamedExec("UPDATE Systems SET Value = :value WHERE Name = :key", params); err != nil {
-		return errors.Wrap(err, "failed to activate new new configuration")
-	} else if count, err := result.RowsAffected(); err != nil {
-		return errors.Wrap(err, "failed to count rows affected")
-	} else if count == 0 {
-		if _, err = tx.NamedExec("INSERT INTO Systems (Name, Value) VALUES (:key, :id)", params); err != nil {
-			return errors.Wrap(err, "failed to activate initial configuration")
-		}
-	}
+
 	if err := tx.Commit(); err != nil {
 		return errors.Wrap(err, "failed to commit transaction")
 	}
@@ -189,35 +204,44 @@ func (ds *databaseStore) persist(cfg *model.Config) error {
 	return nil
 }
 
+// initialize ensures the requisite tables in place to form the backing store.
+func (ds *DatabaseStore) initialize() error {
+	_, err := ds.db.Exec(`
+		CREATE TABLE IF NOT EXISTS Configurations (
+		    Id VARCHAR(26) PRIMARY KEY,
+		    Value TEXT NOT NULL,
+		    CreateAt BIGINT NOT NULL,
+		    Active BOOLEAN NULL UNIQUE
+		)
+	`)
+	if err != nil {
+		return errors.Wrap(err, "failed to create Configurations table")
+	}
+
+	return nil
+}
+
 // Load updates the current configuration from the backing store.
-func (ds *databaseStore) Load() (err error) {
+func (ds *DatabaseStore) Load() (err error) {
 	var f io.ReadCloser
 	var needsSave bool
-	var configurationId string
 	var configurationData []byte
 
-	// Attempt to identify the active configuration
-	params := map[string]interface{}{
-		"key": "ConfigurationId",
-	}
-
-	row := ds.db.QueryRow("SELECT Value FROM Systems WHERE Name = :key", params)
-	if err := row.Scan(&configurationId); err != nil && err != sql.ErrNoRows {
-		return errors.Wrap(err, "failed to query systems table for active configuration")
-	}
-	if configurationId != "" {
-		row = ds.db.QueryRow("SELECT Value FROM Configurations WHERE Id = :key", params)
-		if err := row.Scan(&configurationData); err == sql.ErrNoRows {
-			mlog.Warn("Failed to find active configuration; falling back to default", mlog.String("configuration_id", configurationId))
-		} else if err != nil {
-			return errors.Wrapf(err, "failed to query active configuration %s", configurationId)
-		}
+	row := ds.db.QueryRow("SELECT Value FROM Configurations WHERE Active")
+	if err = row.Scan(&configurationData); err != nil && err != sql.ErrNoRows {
+		return errors.Wrap(err, "failed to query active configuration")
 	}
 
 	// Initialize from the default config if no active configuration could be found.
 	if len(configurationData) == 0 {
 		defaultCfg := model.Config{}
 		defaultCfg.SetDefaults()
+
+		// Assume the database storing the config is also to be used for the application.
+		// This can be overridden using environment variables on first start if necessary,
+		// or changed from the system console afterwards.
+		*defaultCfg.SqlSettings.DriverName = ds.driverName
+		*defaultCfg.SqlSettings.DataSource = ds.dataSourceName
 
 		configurationData, err = marshalConfig(&defaultCfg)
 		if err != nil {
@@ -273,7 +297,7 @@ func (ds *databaseStore) Load() (err error) {
 }
 
 // Save writes the current configuration to the backing store.
-func (ds *databaseStore) Save() error {
+func (ds *DatabaseStore) Save() error {
 	ds.configLock.RLock()
 	defer ds.configLock.RUnlock()
 
@@ -281,11 +305,11 @@ func (ds *databaseStore) Save() error {
 }
 
 // String returns the path to the database backing the config.
-func (ds *databaseStore) String() string {
-	return ds.dsn
+func (ds *DatabaseStore) String() string {
+	return ds.originalDsn
 }
 
 // Close cleans up resources associated with the store.
-func (ds *databaseStore) Close() error {
+func (ds *DatabaseStore) Close() error {
 	return ds.db.Close()
 }
